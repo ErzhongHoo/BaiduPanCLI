@@ -321,22 +321,102 @@ def download_file(dlink: str, access_token: str, save_path: str, file_size: int 
     os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
 
     mode = "ab" if downloaded > 0 else "wb"
+    start_time = time.time()
+    last_downloaded = downloaded
+
     with open(temp_path, mode) as f:
         chunk_size = 1024 * 1024  # 1MB
         for chunk in resp.iter_content(chunk_size=chunk_size):
             if chunk:
                 f.write(chunk)
                 downloaded += len(chunk)
+
+                elapsed = time.time() - start_time
+                if elapsed > 0:
+                    speed = (downloaded - last_downloaded) / elapsed
+                    speed_str = f"{format_size(int(speed))}/s"
+                else:
+                    speed_str = "-- B/s"
+
                 if total > 0:
                     percent = downloaded / total * 100
+                    remaining = total - downloaded
+                    if speed > 0:
+                        eta_sec = int(remaining / speed)
+                        eta_str = format_eta(eta_sec)
+                    else:
+                        eta_str = "--:--"
                     bar = "█" * int(percent // 2) + "░" * (50 - int(percent // 2))
-                    print(f"\r    [{bar}] {percent:.1f}% {format_size(downloaded)}/{format_size(total)}", end="")
+                    print(f"\r    [{bar}] {percent:.1f}% {format_size(downloaded)}/{format_size(total)} | {speed_str} | ETA {eta_str}  ", end="")
                 else:
-                    print(f"\r    已下载: {format_size(downloaded)}", end="")
+                    print(f"\r    已下载: {format_size(downloaded)} | {speed_str}  ", end="")
 
     print()  # 换行
 
     # 下载完成，重命名
+    os.rename(temp_path, save_path)
+    return True
+
+
+def _print_overall_progress(downloaded: int, total: int, start_time: float,
+                            file_idx: int, file_count: int, current_file: str):
+    """打印整体下载进度（单行刷新）"""
+    elapsed = time.time() - start_time
+    if elapsed > 0 and downloaded > 0:
+        speed = downloaded / elapsed
+        speed_str = f"{format_size(int(speed))}/s"
+        remaining = total - downloaded
+        eta_str = format_eta(int(remaining / speed)) if speed > 0 else "--:--"
+    else:
+        speed_str = "-- B/s"
+        eta_str = "--:--"
+
+    percent = downloaded / total * 100 if total > 0 else 0
+    bar_len = 30
+    bar = "█" * int(percent / 100 * bar_len) + "░" * (bar_len - int(percent / 100 * bar_len))
+
+    # 截断文件名避免太长
+    name = current_file if len(current_file) <= 25 else "..." + current_file[-22:]
+
+    line = f"\r    [{bar}] {percent:.1f}% {format_size(downloaded)}/{format_size(total)} | {speed_str} | ETA {eta_str} | [{file_idx}/{file_count}] {name}"
+    # 用空格覆盖上一行残留字符
+    print(f"{line:<120}", end="", flush=True)
+
+
+def download_file_batch(dlink: str, access_token: str, save_path: str, file_size: int,
+                        base_downloaded: int, total_size: int, start_time: float,
+                        file_idx: int, file_count: int, rel_path: str) -> bool:
+    """下载单个文件（批量模式），进度汇入整体进度条"""
+    headers = {"User-Agent": USER_AGENT}
+
+    temp_path = save_path + ".downloading"
+    file_downloaded = 0
+
+    if os.path.exists(temp_path):
+        file_downloaded = os.path.getsize(temp_path)
+        if file_size > 0 and file_downloaded >= file_size:
+            os.rename(temp_path, save_path)
+            return True
+        headers["Range"] = f"bytes={file_downloaded}-"
+
+    url = f"{dlink}&access_token={access_token}"
+    resp = requests.get(url, headers=headers, stream=True, allow_redirects=True)
+
+    if resp.status_code not in (200, 206):
+        return False
+
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+
+    mode = "ab" if file_downloaded > 0 else "wb"
+    with open(temp_path, mode) as f:
+        chunk_size = 1024 * 1024
+        for chunk in resp.iter_content(chunk_size=chunk_size):
+            if chunk:
+                f.write(chunk)
+                file_downloaded += len(chunk)
+                current_total = base_downloaded + file_downloaded
+                _print_overall_progress(current_total, total_size, start_time, file_idx, file_count, rel_path)
+
     os.rename(temp_path, save_path)
     return True
 
@@ -417,16 +497,19 @@ def cmd_download(args):
         print(f"[i] 共 {len(files)} 个文件，总大小: {format_size(total_size)}")
         print()
 
+        # 计算已下载的字节数（跳过的文件）
+        total_downloaded = 0
+        start_time = time.time()
+        failed = []
+
         for i, file_item in enumerate(files, 1):
-            # 计算相对路径
             rel_path = file_item["path"][len(remote_path):].lstrip("/")
             save_path = os.path.join(output_dir, os.path.basename(remote_path), rel_path)
 
-            print(f"[{i}/{len(files)}] {rel_path}")
-            
             # 如果文件已存在且大小一致，跳过
             if os.path.exists(save_path) and os.path.getsize(save_path) == file_item.get("size", -1):
-                print(f"    [跳过] 文件已存在且大小一致")
+                total_downloaded += file_item.get("size", 0)
+                _print_overall_progress(total_downloaded, total_size, start_time, i, len(files), rel_path)
                 continue
 
             # 获取 dlink
@@ -434,16 +517,29 @@ def cmd_download(args):
             meta_result = api_file_metas(access_token, [fsid])
 
             if meta_result.get("errno", -1) != 0:
-                print(f"    [✗] 获取下载地址失败: {meta_result}")
+                failed.append(rel_path)
                 continue
 
             meta_list = meta_result.get("list", [])
             if not meta_list or "dlink" not in meta_list[0]:
-                print(f"    [✗] 未获取到下载地址")
+                failed.append(rel_path)
                 continue
 
             dlink = meta_list[0]["dlink"]
-            download_file(dlink, access_token, save_path, file_item.get("size", 0))
+            success = download_file_batch(
+                dlink, access_token, save_path, file_item.get("size", 0),
+                total_downloaded, total_size, start_time, i, len(files), rel_path,
+            )
+            if success:
+                total_downloaded += file_item.get("size", 0)
+            else:
+                failed.append(rel_path)
+
+        print()  # 结束进度条行
+        if failed:
+            print(f"\n[!] {len(failed)} 个文件下载失败：")
+            for f in failed:
+                print(f"    {f}")
 
     else:
         # 下载单个文件
@@ -534,6 +630,18 @@ def format_size(size_bytes: int) -> str:
         size /= 1024
         i += 1
     return f"{size:.1f} {units[i]}"
+
+
+def format_eta(seconds: int) -> str:
+    """格式化剩余时间"""
+    if seconds < 60:
+        return f"{seconds}s"
+    elif seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    else:
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        return f"{h}h{m:02d}m"
 
 
 # ============================================================
