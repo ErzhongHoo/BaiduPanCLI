@@ -32,6 +32,13 @@ class UploadHelperTests(unittest.TestCase):
             actual = baidupan.file_block_md5(Path(handle.name))
         self.assertEqual(actual, [hashlib.md5(b"").hexdigest()])
 
+    def test_upload_block_requires_explicit_success(self) -> None:
+        self.assertFalse(baidupan.upload_block_succeeded(None))
+        self.assertFalse(baidupan.upload_block_succeeded({}))
+        self.assertFalse(baidupan.upload_block_succeeded({"errno": 2}))
+        self.assertTrue(baidupan.upload_block_succeeded({"errno": 0}))
+        self.assertTrue(baidupan.upload_block_succeeded({"md5": "abc"}))
+
 
 if __name__ == "__main__":
     unittest.main()

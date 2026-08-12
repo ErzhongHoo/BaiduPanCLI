@@ -64,6 +64,7 @@ def save_token(token_data: dict):
     token_data["saved_at"] = int(time.time())
     with open(TOKEN_FILE, "w", encoding="utf-8") as f:
         json.dump(token_data, f, indent=2, ensure_ascii=False)
+    TOKEN_FILE.chmod(0o600)
     print(f"[✓] Token 已保存到 {TOKEN_FILE}")
 
 
@@ -381,6 +382,13 @@ def api_create_file(
     return response.json()
 
 
+def upload_block_succeeded(result: dict | None) -> bool:
+    """只接受有明确成功标志的分片响应。"""
+    if not result:
+        return False
+    return bool(result.get("md5")) or result.get("errno") == 0
+
+
 def remote_file_in_parent(access_token: str, remote_path: str) -> dict | None:
     normalized = normalize_remote_path(remote_path)
     parent = os.path.dirname(normalized) or "/"
@@ -446,13 +454,11 @@ def upload_file(
                         )
                     except requests.RequestException as exc:
                         result = {"error": str(exc)}
-                    if result.get("md5") or result.get("errno", 0) == 0:
+                    if upload_block_succeeded(result):
                         break
                     if attempt < UPLOAD_RETRIES:
                         time.sleep(min(2 ** attempt, 16))
-                if not result or (
-                    not result.get("md5") and result.get("errno", 0) != 0
-                ):
+                if not upload_block_succeeded(result):
                     raise RuntimeError(
                         f"分片上传失败: part={part_sequence}, response={result}"
                     )
