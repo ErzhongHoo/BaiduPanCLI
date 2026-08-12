@@ -12,6 +12,7 @@
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -33,21 +34,28 @@ APP_KEY = os.environ.get("APP_KEY", "")
 SECRET_KEY = os.environ.get("SECRET_KEY", "")
 SIGN_KEY = os.environ.get("SIGN_KEY", "")
 
-if not APP_KEY or not SECRET_KEY:
-    print("[✗] 未配置 APP_KEY 或 SECRET_KEY，请检查 .env 文件")
-    sys.exit(1)
-
 CONFIG_DIR = Path.home() / ".baidupan-cli"
 TOKEN_FILE = CONFIG_DIR / "token.json"
 
 BASE_URL = "https://pan.baidu.com"
 AUTH_URL = "https://openapi.baidu.com/oauth/2.0"
+UPLOAD_URL = "https://d.pcs.baidu.com/rest/2.0/pcs/superfile2"
 
 USER_AGENT = "pan.baidu.com"
+UPLOAD_BLOCK_SIZE = 4 * 1024 * 1024
+UPLOAD_RETRIES = 5
 
 # ============================================================
 # Token 管理
 # ============================================================
+
+
+def require_app_config():
+    """仅在需要访问开放平台时检查应用密钥。"""
+    if not APP_KEY or not SECRET_KEY:
+        print("[✗] 未配置 APP_KEY 或 SECRET_KEY，请检查 .env 文件")
+        print(f"    配置文件位置: {Path(__file__).parent / '.env'}")
+        sys.exit(1)
 
 
 def save_token(token_data: dict):
@@ -70,6 +78,7 @@ def load_token() -> dict:
 
 def get_access_token() -> str:
     """获取有效的 access_token，过期则自动刷新"""
+    require_app_config()
     token_data = load_token()
     saved_at = token_data.get("saved_at", 0)
     expires_in = token_data.get("expires_in", 0)
@@ -106,6 +115,7 @@ def refresh_token(refresh_tok: str) -> dict:
 
 def cmd_auth(args):
     """执行 OAuth2.0 授权流程"""
+    require_app_config()
     # 使用授权码模式，redirect_uri=oob（无 server 场景）
     auth_params = {
         "response_type": "code",
@@ -231,6 +241,295 @@ def api_search(access_token: str, key: str, dir_path: str = "/", recursion: int 
     headers = {"User-Agent": USER_AGENT}
     resp = requests.get(f"{BASE_URL}/rest/2.0/xpan/file", params=params, headers=headers)
     return resp.json()
+
+
+# ============================================================
+# 上传
+# ============================================================
+
+
+def normalize_remote_path(path: str) -> str:
+    """规范化网盘绝对路径，保留 /apps/<应用名> 约束。"""
+    value = "/" + str(path).strip().lstrip("/")
+    while "//" in value:
+        value = value.replace("//", "/")
+    return value.rstrip("/") or "/"
+
+
+def api_create_directory(access_token: str, path: str) -> dict:
+    params = {"method": "create", "access_token": access_token}
+    data = {
+        "path": normalize_remote_path(path),
+        "size": 0,
+        "isdir": 1,
+        "block_list": "[]",
+        "rtype": 3,
+    }
+    response = requests.post(
+        f"{BASE_URL}/rest/2.0/xpan/file",
+        params=params,
+        data=data,
+        headers={"User-Agent": USER_AGENT},
+        timeout=60,
+    )
+    return response.json()
+
+
+def ensure_remote_directory(access_token: str, path: str) -> None:
+    """逐级创建目录；已存在目录由 rtype=3 安全覆盖。"""
+    normalized = normalize_remote_path(path)
+    if normalized == "/":
+        return
+    parts = normalized.strip("/").split("/")
+    current = ""
+    if parts and parts[0].lower() == "apps":
+        # /apps 是开放平台保留根目录，应用无权重复创建。
+        current = "/apps"
+        parts = parts[1:]
+    for part in parts:
+        current += "/" + part
+        result = api_create_directory(access_token, current)
+        if result.get("errno", -1) not in (0, -8):
+            raise RuntimeError(
+                f"创建目录失败: {current}, errno={result.get('errno')}, "
+                f"response={result}"
+            )
+
+
+def file_block_md5(path: Path, block_size: int = UPLOAD_BLOCK_SIZE) -> list[str]:
+    """按百度网盘上传协议计算每个分片的 MD5。"""
+    digests = []
+    with path.open("rb") as handle:
+        while block := handle.read(block_size):
+            digests.append(hashlib.md5(block).hexdigest())
+    return digests or [hashlib.md5(b"").hexdigest()]
+
+
+def api_precreate(
+    access_token: str,
+    remote_path: str,
+    size: int,
+    block_list: list[str],
+) -> dict:
+    params = {"method": "precreate", "access_token": access_token}
+    data = {
+        "path": normalize_remote_path(remote_path),
+        "size": size,
+        "isdir": 0,
+        "autoinit": 1,
+        "rtype": 3,
+        "block_list": json.dumps(block_list),
+    }
+    response = requests.post(
+        f"{BASE_URL}/rest/2.0/xpan/file",
+        params=params,
+        data=data,
+        headers={"User-Agent": USER_AGENT},
+        timeout=120,
+    )
+    return response.json()
+
+
+def api_upload_block(
+    access_token: str,
+    remote_path: str,
+    upload_id: str,
+    part_sequence: int,
+    block: bytes,
+) -> dict:
+    params = {
+        "method": "upload",
+        "access_token": access_token,
+        "type": "tmpfile",
+        "path": normalize_remote_path(remote_path),
+        "uploadid": upload_id,
+        "partseq": part_sequence,
+    }
+    response = requests.post(
+        UPLOAD_URL,
+        params=params,
+        files={"file": ("blob", block, "application/octet-stream")},
+        headers={"User-Agent": USER_AGENT},
+        timeout=300,
+    )
+    return response.json()
+
+
+def api_create_file(
+    access_token: str,
+    remote_path: str,
+    size: int,
+    upload_id: str,
+    block_list: list[str],
+) -> dict:
+    params = {"method": "create", "access_token": access_token}
+    data = {
+        "path": normalize_remote_path(remote_path),
+        "size": size,
+        "isdir": 0,
+        "uploadid": upload_id,
+        "block_list": json.dumps(block_list),
+        "rtype": 3,
+    }
+    response = requests.post(
+        f"{BASE_URL}/rest/2.0/xpan/file",
+        params=params,
+        data=data,
+        headers={"User-Agent": USER_AGENT},
+        timeout=120,
+    )
+    return response.json()
+
+
+def remote_file_in_parent(access_token: str, remote_path: str) -> dict | None:
+    normalized = normalize_remote_path(remote_path)
+    parent = os.path.dirname(normalized) or "/"
+    start = 0
+    while True:
+        result = api_list_files(access_token, parent, start=start, limit=1000)
+        if result.get("errno", -1) != 0:
+            return None
+        entries = result.get("list", [])
+        for item in entries:
+            if normalize_remote_path(item.get("path", "")) == normalized:
+                return item
+        if len(entries) < 1000:
+            return None
+        start += len(entries)
+
+
+def upload_file(
+    access_token: str,
+    local_path: Path,
+    remote_path: str,
+    *,
+    overwrite: bool = False,
+) -> bool:
+    local_path = local_path.resolve()
+    remote_path = normalize_remote_path(remote_path)
+    size = local_path.stat().st_size
+    existing = remote_file_in_parent(access_token, remote_path)
+    if existing and existing.get("size") == size and not overwrite:
+        print(f"[跳过] 远端已有同尺寸文件: {remote_path}")
+        return True
+
+    ensure_remote_directory(access_token, os.path.dirname(remote_path))
+    print(f"[i] 计算分片校验: {local_path.name} ({format_size(size)})")
+    block_list = file_block_md5(local_path)
+    if len(block_list) > 1024:
+        raise ValueError(
+            f"文件需要 {len(block_list)} 个4 MiB分片，超过接口上限1024"
+        )
+
+    precreate = api_precreate(access_token, remote_path, size, block_list)
+    if precreate.get("errno", -1) != 0:
+        raise RuntimeError(f"预上传失败: {remote_path}, response={precreate}")
+
+    upload_id = precreate.get("uploadid")
+    requested = precreate.get("block_list", list(range(len(block_list))))
+    if upload_id and requested:
+        requested = [int(value) for value in requested]
+        started = time.time()
+        with local_path.open("rb") as handle:
+            for done, part_sequence in enumerate(requested, 1):
+                handle.seek(part_sequence * UPLOAD_BLOCK_SIZE)
+                block = handle.read(UPLOAD_BLOCK_SIZE)
+                result = None
+                for attempt in range(1, UPLOAD_RETRIES + 1):
+                    try:
+                        result = api_upload_block(
+                            access_token,
+                            remote_path,
+                            upload_id,
+                            part_sequence,
+                            block,
+                        )
+                    except requests.RequestException as exc:
+                        result = {"error": str(exc)}
+                    if result.get("md5") or result.get("errno", 0) == 0:
+                        break
+                    if attempt < UPLOAD_RETRIES:
+                        time.sleep(min(2 ** attempt, 16))
+                if not result or (
+                    not result.get("md5") and result.get("errno", 0) != 0
+                ):
+                    raise RuntimeError(
+                        f"分片上传失败: part={part_sequence}, response={result}"
+                    )
+                uploaded = min((part_sequence + 1) * UPLOAD_BLOCK_SIZE, size)
+                elapsed = max(time.time() - started, 1e-6)
+                speed = uploaded / elapsed
+                percent = uploaded / max(size, 1) * 100
+                print(
+                    f"\r    {percent:6.2f}% {format_size(uploaded)}/"
+                    f"{format_size(size)} {format_size(int(speed))}/s "
+                    f"({done}/{len(requested)} blocks)",
+                    end="",
+                    flush=True,
+                )
+        print()
+
+    if not upload_id:
+        # 秒传成功时部分接口版本不返回 uploadid，远端文件已创建。
+        existing = remote_file_in_parent(access_token, remote_path)
+        if existing and existing.get("size") == size:
+            print(f"[✓] 秒传完成: {remote_path}")
+            return True
+        raise RuntimeError(f"预上传未返回 uploadid: {precreate}")
+
+    created = api_create_file(
+        access_token,
+        remote_path,
+        size,
+        upload_id,
+        block_list,
+    )
+    if created.get("errno", -1) != 0:
+        raise RuntimeError(f"创建远端文件失败: {remote_path}, response={created}")
+    print(f"[✓] 上传完成: {remote_path}")
+    return True
+
+
+def cmd_mkdir(args):
+    access_token = get_access_token()
+    ensure_remote_directory(access_token, args.path)
+    print(f"[✓] 目录已就绪: {normalize_remote_path(args.path)}")
+
+
+def cmd_upload(args):
+    access_token = get_access_token()
+    local_path = Path(args.local)
+    if not local_path.exists():
+        raise FileNotFoundError(f"本地路径不存在: {local_path}")
+
+    remote_text = str(args.remote)
+    remote = normalize_remote_path(remote_text)
+    if local_path.is_file():
+        target = remote
+        if remote_text.endswith("/") or args.into_directory:
+            target = normalize_remote_path(remote + "/" + local_path.name)
+        upload_file(
+            access_token,
+            local_path,
+            target,
+            overwrite=args.overwrite,
+        )
+        return
+
+    root_remote = normalize_remote_path(remote + "/" + local_path.name)
+    files = sorted(path for path in local_path.rglob("*") if path.is_file())
+    total_size = sum(path.stat().st_size for path in files)
+    print(f"[i] 递归上传 {len(files)} 个文件，共 {format_size(total_size)}")
+    ensure_remote_directory(access_token, root_remote)
+    for index, path in enumerate(files, 1):
+        relative = path.relative_to(local_path).as_posix()
+        print(f"\n[{index}/{len(files)}] {relative}")
+        upload_file(
+            access_token,
+            path,
+            root_remote + "/" + relative,
+            overwrite=args.overwrite,
+        )
 
 
 def cmd_search(args):
@@ -651,7 +950,7 @@ def format_eta(seconds: int) -> str:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="百度网盘数据集拉取工具",
+        description="百度网盘命令行上传与下载工具",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用示例:
@@ -660,6 +959,7 @@ def main():
   python baidupan.py ls /                    # 列出根目录
   python baidupan.py ls /datasets            # 列出 /datasets 目录
   python baidupan.py search "train"          # 搜索文件
+  python baidupan.py upload ./release /apps/MyApp/release  # 递归上传
   python baidupan.py download /datasets/mnist -o ./data   # 下载到本地
         """,
     )
@@ -686,6 +986,25 @@ def main():
     dl_parser.add_argument("path", help="网盘文件/文件夹路径")
     dl_parser.add_argument("-o", "--output", default=".", help="本地保存目录 (默认: 当前目录)")
 
+    # mkdir
+    mkdir_parser = subparsers.add_parser("mkdir", help="递归创建网盘目录")
+    mkdir_parser.add_argument("path", help="网盘目录，需位于 /apps/<应用名> 下")
+
+    # upload
+    upload_parser = subparsers.add_parser("upload", help="上传文件或递归上传目录")
+    upload_parser.add_argument("local", help="本地文件或目录")
+    upload_parser.add_argument("remote", help="网盘目标路径")
+    upload_parser.add_argument(
+        "--into-directory",
+        action="store_true",
+        help="将单文件放入目标目录并保留本地文件名",
+    )
+    upload_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="覆盖远端同路径文件；默认同尺寸时跳过",
+    )
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -697,6 +1016,8 @@ def main():
         "info": cmd_info,
         "ls": cmd_ls,
         "search": cmd_search,
+        "mkdir": cmd_mkdir,
+        "upload": cmd_upload,
         "download": cmd_download,
     }
 

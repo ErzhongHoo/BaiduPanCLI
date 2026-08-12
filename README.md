@@ -10,6 +10,7 @@
 - 📂 浏览网盘文件列表
 - 🔍 搜索文件
 - ⬇️ 下载文件/文件夹（递归下载）
+- ⬆️ 分片上传文件/文件夹（递归上传、失败重试、同尺寸跳过）
 - 🔄 断点续传（中断后重新执行自动从断点继续）
 - ⏭️ 自动跳过已下载的文件
 
@@ -79,7 +80,27 @@ python baidupan.py download /Apps/MyDataset/data.zip -o ./data
 python baidupan.py download /Apps/MyDataset -o ./data
 ```
 
-### 5. 查看用户信息
+### 5. 上传
+
+开放平台只允许应用写入 `/apps/<应用名>`。先运行 `ls /apps` 确认应用目录名。
+
+```bash
+# 创建目录
+python baidupan.py mkdir /apps/你的应用名/3DHPSE-paper
+
+# 上传单个文件
+python baidupan.py upload ./model_best_iter4.pth.tar \
+  /apps/你的应用名/3DHPSE-paper/model_best_iter4.pth.tar
+
+# 递归上传目录，远端会保留本地目录名
+python baidupan.py upload ./paper_release_20260812 \
+  /apps/你的应用名
+```
+
+文件按 4 MiB 分片上传。再次执行相同命令时，远端同路径且同尺寸的文件会自动跳过；
+需要覆盖时增加 `--overwrite`。
+
+### 6. 查看用户信息
 
 ```bash
 python baidupan.py info
@@ -129,7 +150,7 @@ access_token 过期时自动使用 refresh_token 刷新，无需重新授权。
 
 ## 注意事项
 
-- 百度网盘开放平台第三方应用默认只能下载 `/apps/<应用名>` 目录下的文件（`ls` 可以浏览全盘）
+- 百度网盘开放平台第三方应用只能向 `/apps/<应用名>` 写入文件
 - 下载链接 (dlink) 有效期 8 小时，工具会在下载时实时获取
 - 大文件下载速度受百度网盘开放平台限速影响
 
