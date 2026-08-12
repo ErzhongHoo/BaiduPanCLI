@@ -289,6 +289,11 @@ def ensure_remote_directory(access_token: str, path: str) -> None:
         parts = parts[1:]
     for part in parts:
         current += "/" + part
+        existing = remote_file_in_parent(access_token, current)
+        if existing:
+            if existing.get("isdir", 0):
+                continue
+            raise RuntimeError(f"远程路径已存在且不是目录: {current}")
         result = api_create_directory(access_token, current)
         if result.get("errno", -1) not in (0, -8):
             raise RuntimeError(

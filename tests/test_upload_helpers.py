@@ -4,6 +4,7 @@ import hashlib
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import baidupan
 
@@ -38,6 +39,23 @@ class UploadHelperTests(unittest.TestCase):
         self.assertFalse(baidupan.upload_block_succeeded({"errno": 2}))
         self.assertTrue(baidupan.upload_block_succeeded({"errno": 0}))
         self.assertTrue(baidupan.upload_block_succeeded({"md5": "abc"}))
+
+    @patch("baidupan.api_create_directory")
+    @patch("baidupan.remote_file_in_parent")
+    def test_ensure_remote_directory_skips_existing_app_root(
+        self,
+        remote_file_in_parent,
+        api_create_directory,
+    ) -> None:
+        remote_file_in_parent.side_effect = [
+            {"path": "/apps/Demo", "isdir": 1},
+            None,
+        ]
+        api_create_directory.return_value = {"errno": 0}
+
+        baidupan.ensure_remote_directory("token", "/apps/Demo/paper")
+
+        api_create_directory.assert_called_once_with("token", "/apps/Demo/paper")
 
 
 if __name__ == "__main__":
